@@ -5,7 +5,6 @@ import { GoogleGenerativeAI, Content } from "@google/generative-ai";
 /* ============================================================
    CLIENTS
    ============================================================ */
-
 const groq = new OpenAI({
   apiKey: process.env.GROQ_API_KEY,
   baseURL: "https://api.groq.com/openai/v1",
@@ -19,19 +18,13 @@ const cerebras = new OpenAI({
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 const gemini = genAI.getGenerativeModel({
   model: "gemini-2.5-flash",
-  generationConfig: {
-    responseMimeType: "application/json",
-  },
+  generationConfig: { responseMimeType: "application/json" },
 });
 
 /* ============================================================
    TYPES
    ============================================================ */
-
-type ConversationTurn = {
-  role: "user" | "assistant";
-  content: string;
-};
+type ConversationTurn = { role: "user" | "assistant"; content: string };
 
 type AnswerMetadata = {
   questionNumber: number;
@@ -43,13 +36,12 @@ type AnswerMetadata = {
   idealDurationRange: string;
   silencePausesCount: number;
   longestPauseSeconds: number;
-  cameraSnapshot?: string; // base64 image
+  cameraSnapshot?: string;
 };
 
 /* ============================================================
-   COACH MODE SYSTEM PROMPT
+   COACH MODE PROMPT
    ============================================================ */
-
 function buildCoachPrompt(
   role: string,
   company: string,
@@ -106,9 +98,52 @@ STRICT RULES:
 }
 
 /* ============================================================
-   INTERVIEW MODE SYSTEM PROMPT
+   COACH QUESTION MODE PROMPT — NEW
+   Used when the user clicks "Ask a Question" during a coaching
+   session. AI must answer the user's question directly and NOT
+   ask another interview question.
    ============================================================ */
+function buildCoachQuestionPrompt(
+  role: string,
+  interviewType: string,
+  difficulty: string
+): string {
+  return `You are a warm, expert career coach helping someone prepare for a ${interviewType} interview for the ${role} role at ${difficulty} level.
 
+The candidate has PAUSED their practice session to ask YOU a direct coaching question. They need help with something specific — not another interview question.
+
+YOUR ONLY JOB: Answer their question helpfully and directly.
+
+DO NOT:
+- Ask them another interview question
+- Give feedback on a previous answer
+- Say "here's your next question"
+- Return a "nextQuestion" field
+
+DO:
+- Answer exactly what they asked
+- Be specific, practical, and warm
+- Use bullet points if listing tips or steps
+- Keep it to 2-4 paragraphs max
+
+OUTPUT FORMAT — respond ONLY with this JSON, no markdown, no backticks:
+{
+  "coachAnswer": "your full helpful answer here"
+}
+
+Examples of what they might ask and how to respond:
+- "How do I use STAR method?" → Explain Situation, Task, Action, Result with a concrete example
+- "How do I handle salary questions?" → Give specific negotiation advice
+- "I get nervous in interviews, tips?" → Give practical calming techniques
+- "How do I explain a gap in my resume?" → Give a specific reframing strategy
+- "What should I ask the interviewer?" → Give 3-4 strong questions to ask
+
+STRICT: Output ONLY raw JSON with the "coachAnswer" field. Nothing else.`;
+}
+
+/* ============================================================
+   INTERVIEW MODE PROMPT
+   ============================================================ */
 function buildInterviewPrompt(
   role: string,
   company: string,
@@ -123,14 +158,10 @@ function buildInterviewPrompt(
     : "";
 
   const roundPersona: Record<string, string> = {
-    Screening:
-      "You are an HR recruiter conducting a first-round screening call. Friendly but efficient. Focus on resume fit, communication clarity, and basic culture fit.",
-    Technical:
-      "You are a senior engineer conducting a technical interview. Precise, direct, no-nonsense. Focus on role-specific skills, problem solving, and technical depth.",
-    Behavioral:
-      "You are a hiring manager conducting a behavioral interview. Probing and STAR-focused. Dig deep into past experiences, leadership, and decision-making.",
-    Final:
-      "You are a senior leader conducting a final-round interview. Strategic, culture-focused. Assess long-term fit, leadership potential, and vision alignment.",
+    Screening: "You are an HR recruiter conducting a first-round screening call. Friendly but efficient. Focus on resume fit, communication clarity, and basic culture fit.",
+    Technical: "You are a senior engineer conducting a technical interview. Precise, direct, no-nonsense. Focus on role-specific skills, problem solving, and technical depth.",
+    Behavioral: "You are a hiring manager conducting a behavioral interview. Probing and STAR-focused. Dig deep into past experiences, leadership, and decision-making.",
+    Final: "You are a senior leader conducting a final-round interview. Strategic, culture-focused. Assess long-term fit, leadership potential, and vision alignment.",
   };
 
   const persona = roundPersona[round] || roundPersona["Behavioral"];
@@ -146,22 +177,34 @@ function buildInterviewPrompt(
 
 You are interviewing a candidate for a ${interviewType} interview for the ${role} role ${companyLine} at ${difficulty} level.${resumeSection}
 
-INTERVIEW RULES:
-- Formal and direct. Zero hand-holding. Zero hints.
+INTERVIEW FLOW — CRITICAL:
+
+PHASE 1 — GREETING (question 0, not scored, not counted in the 6):
+When the user sends "START", respond with:
+{ "done": false, "question": "Hi! Welcome. Before we dive in — tell me a little about yourself and what drew you to the ${role} role.", "questionNumber": 0, "phase": "greeting" }
+
+After the candidate answers the greeting, respond with:
+{ "done": false, "question": "Great, thanks for sharing that. Ready to begin the interview? Let's get started.", "questionNumber": 0, "phase": "transition" }
+
+After the transition, begin with question 1.
+
+PHASE 2 — INTERVIEW (questions 1-6, scored):
 - Ask exactly ONE question per turn.
-- Ask dynamic follow-up questions based on what the candidate actually said.
 - After EXACTLY 6 questions and answers, generate the final evaluation report.
-- NEVER give feedback or hints during the interview. Real interviewers don't.
+- NEVER give feedback or hints during the interview.
 - NEVER break character.
 
-IDEAL ANSWER DURATION FOR THIS ROUND: ${idealDuration[round] || "90-120s"}
+IDEAL ANSWER DURATION: ${idealDuration[round] || "90-120s"}
 
 OUTPUT FORMAT:
 
-For questions 1 through 6, respond ONLY with:
+For greeting/transition (questionNumber: 0):
+{ "done": false, "question": "your question here", "questionNumber": 0, "phase": "greeting" }
+
+For questions 1-6:
 { "done": false, "question": "your question text here", "questionNumber": <1-6> }
 
-After the candidate answers question 6, respond ONLY with:
+After question 6 is answered:
 {
   "done": true,
   "report": {
@@ -172,19 +215,10 @@ After the candidate answers question 6, respond ONLY with:
     "confidence": <0-100>,
     "presence": <0-100>,
     "verdict": "Ready to Interview" | "Almost There" | "Needs Practice" | "Not Ready",
-    "strengths": "• specific strength with example from session\\n• another strength",
-    "weaknesses": "• specific actionable improvement\\n• another improvement",
+    "strengths": "• specific strength\\n• another strength",
+    "weaknesses": "• specific improvement\\n• another improvement",
     "answerBreakdown": [
-      {
-        "questionNumber": 1,
-        "questionText": "the question asked",
-        "relevance": <0-100>,
-        "clarity": <0-100>,
-        "depth": <0-100>,
-        "communication": <0-100>,
-        "confidence": <0-100>,
-        "presence": <0-100>
-      }
+      { "questionNumber": 1, "questionText": "the question", "relevance": 0, "clarity": 0, "depth": 0, "communication": 0, "confidence": 0, "presence": 0 }
     ],
     "avgAnswerDurationSeconds": <number>,
     "totalFillerWords": <number>,
@@ -192,39 +226,19 @@ After the candidate answers question 6, respond ONLY with:
   }
 }
 
-SCORING GUIDE:
-- relevance: Did the answer actually address the question?
-- clarity: Was the answer structured, logical, easy to follow?
-- depth: Were there specific examples, numbers, outcomes? Or vague generalities?
-- communication: Vocabulary, professionalism, sentence structure.
-- confidence: Based on filler word count, hesitation gaps, answer length vs ideal. Low fillers + good length = high confidence.
-- presence: Based on camera snapshot analysis if provided — eye contact, posture, facial engagement. If no snapshot, score based on overall impression from transcript tone.
-
-VERDICT RULES:
-- Average score 80+ → "Ready to Interview"
-- Average score 65-79 → "Almost There"
-- Average score 50-64 → "Needs Practice"
-- Average score below 50 → "Not Ready"
-
-STRICT RULES:
-- Output ONLY raw JSON. No markdown fences. No backticks. No explanation.
-- Never break the JSON structure above under any circumstances.
-- Never exceed 6 questions. Client enforces this but you must too.
-- Strengths and weaknesses must reference SPECIFIC moments from THIS session, not generic advice.`;
+VERDICT: avg 80+ = "Ready to Interview", 65-79 = "Almost There", 50-64 = "Needs Practice", below 50 = "Not Ready"
+COUNTING: greeting (questionNumber:0) does NOT count toward the 6. Only questions 1-6 count.
+STRICT: Output ONLY raw JSON. No markdown. No backticks.`;
 }
 
 /* ============================================================
-   SAFE JSON PARSER (unchanged from original — it works)
+   SAFE JSON PARSER
    ============================================================ */
-
 function parseJSON(text: string) {
   let cleaned = text.replace(/```json|```/g, "").trim();
-
   const start = cleaned.indexOf("{");
   const end = cleaned.lastIndexOf("}");
-  if (start !== -1 && end !== -1) {
-    cleaned = cleaned.slice(start, end + 1);
-  }
+  if (start !== -1 && end !== -1) cleaned = cleaned.slice(start, end + 1);
 
   let result = "";
   let inString = false;
@@ -232,21 +246,9 @@ function parseJSON(text: string) {
 
   for (let i = 0; i < cleaned.length; i++) {
     const ch = cleaned[i];
-    if (escaped) {
-      result += ch;
-      escaped = false;
-      continue;
-    }
-    if (ch === "\\") {
-      escaped = true;
-      result += ch;
-      continue;
-    }
-    if (ch === '"') {
-      inString = !inString;
-      result += ch;
-      continue;
-    }
+    if (escaped) { result += ch; escaped = false; continue; }
+    if (ch === "\\") { escaped = true; result += ch; continue; }
+    if (ch === '"') { inString = !inString; result += ch; continue; }
     if (inString) {
       if (ch === "\n") { result += "\\n"; continue; }
       if (ch === "\r") { result += "\\r"; continue; }
@@ -254,194 +256,137 @@ function parseJSON(text: string) {
     }
     result += ch;
   }
-
   return JSON.parse(result);
 }
 
 /* ============================================================
    BUILD GEMINI HISTORY
-   Converts our ConversationTurn[] into Gemini's Content[] format.
-   System prompt is injected as the first user/model exchange.
    ============================================================ */
-
-function buildGeminiHistory(
-  systemPrompt: string,
-  history: ConversationTurn[]
-): Content[] {
+function buildGeminiHistory(systemPrompt: string, history: ConversationTurn[]): Content[] {
   const geminiHistory: Content[] = [
-    // Inject system prompt as a priming exchange
-    {
-      role: "user",
-      parts: [{ text: systemPrompt }],
-    },
-    {
-      role: "model",
-      parts: [{ text: '{"nextQuestion": "Ready.", "feedback": null}' }],
-    },
+    { role: "user", parts: [{ text: systemPrompt }] },
+    { role: "model", parts: [{ text: '{"nextQuestion": "Ready.", "feedback": null}' }] },
   ];
-
-  // Add real conversation history
   for (const turn of history) {
     geminiHistory.push({
       role: turn.role === "assistant" ? "model" : "user",
       parts: [{ text: turn.content }],
     });
   }
-
   return geminiHistory;
 }
 
 /* ============================================================
-   BUILD OPENAI-COMPATIBLE MESSAGES
-   For Groq and Cerebras (both use OpenAI message format)
+   BUILD OPENAI MESSAGES
    ============================================================ */
-
 function buildOpenAIMessages(
   systemPrompt: string,
   history: ConversationTurn[],
   currentMessage: string
 ): { role: "system" | "user" | "assistant"; content: string }[] {
-  const messages: { role: "system" | "user" | "assistant"; content: string }[] =
-    [{ role: "system", content: systemPrompt }];
-
+  const messages: { role: "system" | "user" | "assistant"; content: string }[] = [
+    { role: "system", content: systemPrompt },
+  ];
   for (const turn of history) {
-    messages.push({
-      role: turn.role === "assistant" ? "assistant" : "user",
-      content: turn.content,
-    });
+    messages.push({ role: turn.role === "assistant" ? "assistant" : "user", content: turn.content });
   }
-
   messages.push({ role: "user", content: currentMessage });
-
   return messages;
 }
 
 /* ============================================================
    BUILD METADATA SUMMARY
-   Converts answer metadata array into a text summary for the
-   final report prompt so the AI can score confidence properly.
    ============================================================ */
-
 function buildMetadataSummary(metadata: AnswerMetadata[]): string {
   if (!metadata || metadata.length === 0) return "";
-
-  const lines = metadata.map((m) => {
+  const lines = metadata.map(m => {
     const snapshot = m.cameraSnapshot ? " [camera snapshot provided]" : " [no snapshot]";
     return `Q${m.questionNumber}: "${m.questionText}"
   → Duration: ${m.answerDurationSeconds}s (ideal: ${m.idealDurationRange})
   → Filler words: ${m.fillerWordCount} (${m.fillerWords.join(", ") || "none"})
   → Silence pauses: ${m.silencePausesCount} (longest: ${m.longestPauseSeconds}s)
-  → Camera: ${snapshot}`;
+  → Camera:${snapshot}`;
   });
-
-  return `\n\nSESSION METADATA (use this to score Confidence and Presence accurately):\n${lines.join("\n\n")}`;
+  return `\n\nSESSION METADATA:\n${lines.join("\n\n")}`;
 }
 
 /* ============================================================
    MAIN API HANDLER
    ============================================================ */
-
 export async function POST(req: Request) {
   try {
     const body = await req.json();
 
     const {
-      // Shared
-      mode = "coach",           // "coach" | "interview"
+      mode = "coach",
       role = "Software Engineer",
       company = "",
       interviewType = "Behavioral",
       difficulty = "Mid-Level",
       resumeText = "",
-
-      // Conversation history — full array sent every turn
-      // Each turn: { role: "user" | "assistant", content: string }
       conversationHistory = [] as ConversationTurn[],
-
-      // Current user message
       message = "START",
-
-      // Coach-only
-      // (nothing extra for now)
-
-      // Interview-only
-      round = "Behavioral",     // "Screening" | "Technical" | "Behavioral" | "Final"
-      answerMetadata = [] as AnswerMetadata[], // array of per-answer metadata
-      integrityFlags = 0,       // tab-switch violation count
+      round = "Behavioral",
+      answerMetadata = [] as AnswerMetadata[],
+      integrityFlags = 0,
+      cameraViolations = 0,
     } = body;
 
-    // Build the right system prompt based on mode
-    const systemPrompt =
-      mode === "interview"
-        ? buildInterviewPrompt(role, company, interviewType, difficulty, round, resumeText)
-        : buildCoachPrompt(role, company, interviewType, difficulty, resumeText);
+    // ── SELECT SYSTEM PROMPT BASED ON MODE ──────────────────────
+    // "coach"          → normal coaching session (asks interview questions + feedback)
+    // "coach-question" → user asked a coaching question, AI must answer it directly
+    // "interview"      → mock interview mode
+    let systemPrompt: string;
 
-    // For interview final report: append metadata summary to the message
+    if (mode === "interview") {
+      systemPrompt = buildInterviewPrompt(role, company, interviewType, difficulty, round, resumeText);
+    } else if (mode === "coach-question") {
+      systemPrompt = buildCoachQuestionPrompt(role, interviewType, difficulty);
+    } else {
+      systemPrompt = buildCoachPrompt(role, company, interviewType, difficulty, resumeText);
+    }
+
+    // For interview final report: append metadata summary
     const finalMessage =
       mode === "interview" && answerMetadata.length === 6
-        ? `${message}\n\n${buildMetadataSummary(answerMetadata)}\n\nIntegrity flags (tab switches): ${integrityFlags}`
+        ? `${message}\n\n${buildMetadataSummary(answerMetadata)}\n\nIntegrity flags (tab switches): ${integrityFlags}\nCamera violations: ${cameraViolations}`
         : message;
 
-    /* --------------------------------------------------
-       TRY 1 — GEMINI 2.5 FLASH (primary)
-    -------------------------------------------------- */
+    /* ── TRY 1: GEMINI ──────────────────────────────────────── */
     try {
       const geminiHistory = buildGeminiHistory(systemPrompt, conversationHistory);
-
       const chat = gemini.startChat({ history: geminiHistory });
       const result = await chat.sendMessage(finalMessage);
       const text = result.response.text();
-
-      console.log("[Gemini] raw:", text.slice(0, 200));
-
+      console.log(`[Gemini][${mode}] raw:`, text.slice(0, 200));
       const parsed = parseJSON(text);
       return NextResponse.json({ provider: "gemini", ...parsed });
-
     } catch (geminiError) {
       console.warn("[Gemini] failed →", geminiError);
 
-      /* --------------------------------------------------
-         TRY 2 — GROQ llama-3.3-70b (fallback 1)
-      -------------------------------------------------- */
+      /* ── TRY 2: GROQ ──────────────────────────────────────── */
       try {
-        const messages = buildOpenAIMessages(
-          systemPrompt,
-          conversationHistory,
-          finalMessage
-        );
-
+        const messages = buildOpenAIMessages(systemPrompt, conversationHistory, finalMessage);
         const completion = await groq.chat.completions.create({
           model: "llama-3.3-70b-versatile",
           messages,
           response_format: { type: "json_object" },
         });
-
         const text = completion.choices[0].message.content || "";
-        console.log("[Groq] raw:", text.slice(0, 200));
-
+        console.log(`[Groq][${mode}] raw:`, text.slice(0, 200));
         const parsed = parseJSON(text);
         return NextResponse.json({ provider: "groq", ...parsed });
-
       } catch (groqError) {
         console.warn("[Groq] failed →", groqError);
 
-        /* --------------------------------------------------
-           TRY 3 — CEREBRAS llama3.1-70b (fallback 2)
-        -------------------------------------------------- */
-        const messages = buildOpenAIMessages(
-          systemPrompt,
-          conversationHistory,
-          finalMessage
-        );
-
+        /* ── TRY 3: CEREBRAS ──────────────────────────────────── */
+        const messages = buildOpenAIMessages(systemPrompt, conversationHistory, finalMessage);
         const completion = await cerebras.chat.completions.create({
           model: "llama3.1-70b",
           messages,
         });
-
         const text = completion.choices[0].message.content || "";
-        console.log("[Cerebras] raw:", text.slice(0, 200));
-
+        console.log(`[Cerebras][${mode}] raw:`, text.slice(0, 200));
         const parsed = parseJSON(text);
         return NextResponse.json({ provider: "cerebras", ...parsed });
       }
@@ -449,11 +394,10 @@ export async function POST(req: Request) {
 
   } catch (error) {
     console.error("[API] fatal error:", error);
-
-    // Return a safe fallback so the UI doesn't break
     return NextResponse.json({
       provider: "error",
       nextQuestion: "Something went wrong. Please try again.",
+      coachAnswer: "Something went wrong. Please try again.",
       feedback: null,
       done: false,
     });

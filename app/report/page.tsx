@@ -1,3 +1,4 @@
+// report page
 "use client";
 
 import { useEffect, useState } from "react";
@@ -7,14 +8,17 @@ type Report = {
   relevance: number; clarity: number; depth: number; communication: number; confidence: number; presence: number;
   verdict: string; strengths: string; weaknesses: string;
   answerBreakdown: { questionNumber: number; questionText: string; relevance: number; clarity: number; depth: number; communication: number; confidence: number; presence: number }[];
-  avgAnswerDurationSeconds: number; totalFillerWords: number; integrityFlags?: number; sessionEndedEarly?: boolean;
+  avgAnswerDurationSeconds: number; totalFillerWords: number;
+  integrityFlags?: number;
+  cameraViolations?: number;       // NEW
+  terminationReason?: string;      // NEW: "tab-switch" | "camera-proctoring"
+  sessionEndedEarly?: boolean;
 };
 
-type Meta = { questionNumber: number; questionText: string; transcript: string; fillerWordCount: number; answerDurationSeconds: number; idealDurationRange: string; skipped?: boolean };
+type Meta = { questionNumber: number; questionText: string; transcript: string; fillerWordCount: number; answerDurationSeconds: number; idealDurationRange: string; skipped?: boolean; cameraViolationType?: string; cameraViolationNote?: string };
 
 function scoreColor(s: number) { return s >= 80 ? "#4ade80" : s >= 65 ? "#fbbf24" : s >= 50 ? "#f87171" : "#ef4444"; }
 function barColor(s: number) { return s >= 80 ? "#16a34a" : s >= 65 ? "#d97706" : s >= 50 ? "#dc2626" : "#991b1b"; }
-function scoreBg(s: number) { return s >= 80 ? "rgba(74,222,128,0.1)" : s >= 65 ? "rgba(251,191,36,0.1)" : "rgba(248,113,113,0.1)"; }
 
 function verdictStyle(v: string) {
   if (v === "Ready to Interview") return { bg: "rgba(22,163,74,0.1)", border: "#15803d", text: "#4ade80", icon: "✅" };
@@ -26,6 +30,12 @@ function verdictStyle(v: string) {
 function avg(r: Report) { return Math.round((r.relevance + r.clarity + r.depth + r.communication + r.confidence + r.presence) / 6); }
 function qAvg(q: Report["answerBreakdown"][0]) { return Math.round((q.relevance + q.clarity + q.depth + q.communication + q.confidence + q.presence) / 6); }
 function fmtDur(s: number) { if (!s) return "—"; const m = Math.floor(s / 60); return m === 0 ? `${s}s` : `${m}m ${s % 60}s`; }
+
+function terminationLabel(reason?: string) {
+  if (reason === "tab-switch") return "Session terminated: 3 tab switches detected";
+  if (reason === "camera-proctoring") return "Session terminated: 3 camera violations detected";
+  return "Session ended early";
+}
 
 function ScoreCard({ label, score, desc }: { label: string; score: number; desc: string }) {
   return (
@@ -55,13 +65,24 @@ export default function Report() {
       const raw = sessionStorage.getItem("interviewReport");
       const rawMeta = sessionStorage.getItem("interviewMetadata");
       const flags = sessionStorage.getItem("integrityFlags");
+      const camFlags = sessionStorage.getItem("cameraViolations");
+      const termReason = sessionStorage.getItem("terminationReason");
 
       if (!raw) {
         const lastSession = localStorage.getItem("lastInterviewSession");
         if (lastSession) {
           try {
             const parsed = JSON.parse(lastSession);
-            if (parsed.report) { setReport({ ...parsed.report, integrityFlags: parsed.integrityFlags || 0 }); setMetadata(parsed.allMetadata || []); setLoading(false); return; }
+            if (parsed.report) {
+              setReport({
+                ...parsed.report,
+                integrityFlags: parsed.integrityFlags || 0,
+                cameraViolations: parsed.cameraViolations || 0,
+              });
+              setMetadata(parsed.allMetadata || []);
+              setLoading(false);
+              return;
+            }
           } catch { }
         }
         setNoData(true); setLoading(false); return;
@@ -70,6 +91,8 @@ export default function Report() {
       try {
         const parsed = JSON.parse(raw) as Report;
         if (flags) parsed.integrityFlags = parseInt(flags);
+        if (camFlags) parsed.cameraViolations = parseInt(camFlags);
+        if (termReason) parsed.terminationReason = termReason;
         setReport(parsed);
       } catch { setNoData(true); setLoading(false); return; }
 
@@ -112,6 +135,9 @@ export default function Report() {
   const round = sessionStorage.getItem("round") || "";
   const company = sessionStorage.getItem("company") || "";
 
+  const totalViolations = (report.integrityFlags || 0) + (report.cameraViolations || 0);
+  const wasTerminated = report.sessionEndedEarly && report.terminationReason;
+
   return (
     <main style={base}>
       <div style={{ maxWidth: "720px", margin: "0 auto", padding: "40px 24px 80px" }}>
@@ -121,19 +147,46 @@ export default function Report() {
           <p style={{ fontSize: "11px", color: "#555", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: "6px" }}>Evaluation Report</p>
           <h1 style={{ fontSize: "24px", fontWeight: 700, marginBottom: "4px" }}>{role || "Interview"} · {round || "Round"}</h1>
           {company && <p style={{ fontSize: "13px", color: "#666" }}>{company}</p>}
-          {report.sessionEndedEarly && <p style={{ fontSize: "12px", color: "#fbbf24", marginTop: "6px" }}>⚠️ Session ended early — partial evaluation</p>}
+          {report.sessionEndedEarly && (
+            <p style={{ fontSize: "12px", color: "#fbbf24", marginTop: "6px" }}>
+              ⚠️ {terminationLabel(report.terminationReason)}
+            </p>
+          )}
         </div>
 
-        {/* Integrity */}
-        {report.integrityFlags && report.integrityFlags > 0 ? (
-          <div style={{ background: "rgba(127,29,29,0.15)", border: "1px solid #7f1d1d", borderRadius: "12px", padding: "14px 16px", marginBottom: "24px", display: "flex", gap: "12px" }}>
-            <span style={{ color: "#ef4444" }}>⚠️</span>
-            <div>
-              <p style={{ fontSize: "13px", color: "#f87171", fontWeight: 600, marginBottom: "2px" }}>Session Integrity Flag</p>
-              <p style={{ fontSize: "12px", color: "#ef4444" }}>{report.integrityFlags} tab switch{report.integrityFlags > 1 ? "es" : ""} detected during this session.</p>
+        {/* INTEGRITY + CAMERA VIOLATION BLOCK */}
+        {totalViolations > 0 && (
+          <div style={{ background: "rgba(127,29,29,0.15)", border: "1px solid #7f1d1d", borderRadius: "12px", padding: "16px 18px", marginBottom: "24px" }}>
+            <p style={{ fontSize: "13px", color: "#f87171", fontWeight: 600, marginBottom: "10px" }}>⚠️ Session Integrity Report</p>
+            <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+              {(report.integrityFlags || 0) > 0 && (
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div>
+                    <p style={{ fontSize: "13px", color: "#fca5a5" }}>Tab switches detected</p>
+                    <p style={{ fontSize: "11px", color: "#ef4444", marginTop: "2px" }}>Switching tabs during interview is not permitted</p>
+                  </div>
+                  <span style={{ fontSize: "20px", fontWeight: 700, color: "#ef4444" }}>{report.integrityFlags}</span>
+                </div>
+              )}
+              {(report.cameraViolations || 0) > 0 && (
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", paddingTop: (report.integrityFlags || 0) > 0 ? "8px" : "0", borderTop: (report.integrityFlags || 0) > 0 ? "1px solid rgba(127,29,29,0.4)" : "none" }}>
+                  <div>
+                    <p style={{ fontSize: "13px", color: "#fca5a5" }}>Camera violations detected</p>
+                    <p style={{ fontSize: "11px", color: "#ef4444", marginTop: "2px" }}>Face absent, looking away, or multiple people detected</p>
+                  </div>
+                  <span style={{ fontSize: "20px", fontWeight: 700, color: "#ef4444" }}>{report.cameraViolations}</span>
+                </div>
+              )}
+              {wasTerminated && (
+                <div style={{ marginTop: "8px", paddingTop: "8px", borderTop: "1px solid rgba(127,29,29,0.4)" }}>
+                  <p style={{ fontSize: "12px", color: "#ef4444", fontWeight: 600 }}>
+                    ❌ {terminationLabel(report.terminationReason)} — partial evaluation only
+                  </p>
+                </div>
+              )}
             </div>
           </div>
-        ) : null}
+        )}
 
         {/* Verdict */}
         <div style={{ background: vs.bg, border: `1px solid ${vs.border}`, borderRadius: "16px", padding: "28px", textAlign: "center", marginBottom: "32px" }}>
@@ -196,6 +249,11 @@ export default function Report() {
                       <div style={{ display: "flex", alignItems: "center", gap: "12px", minWidth: 0 }}>
                         <span style={{ fontSize: "11px", color: "#555", flexShrink: 0 }}>Q{q.questionNumber}</span>
                         {meta?.skipped && <span style={{ fontSize: "11px", color: "#666", fontStyle: "italic" }}>[skipped]</span>}
+                        {meta?.cameraViolationType && meta.cameraViolationType !== "none" && (
+                          <span style={{ fontSize: "11px", color: "#ef4444", background: "rgba(127,29,29,0.2)", padding: "1px 6px", borderRadius: "4px" }}>
+                            📷 {meta.cameraViolationType}
+                          </span>
+                        )}
                         <p style={{ fontSize: "13px", color: "#e5e7eb", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{q.questionText}</p>
                       </div>
                       <div style={{ display: "flex", alignItems: "center", gap: "12px", flexShrink: 0, marginLeft: "12px" }}>
@@ -219,10 +277,13 @@ export default function Report() {
                           ))}
                         </div>
                         {meta && (
-                          <div style={{ display: "flex", gap: "16px", fontSize: "11px", color: "#555", borderTop: "1px solid #1e1e1e", paddingTop: "12px" }}>
+                          <div style={{ display: "flex", gap: "16px", flexWrap: "wrap", fontSize: "11px", color: "#555", borderTop: "1px solid #1e1e1e", paddingTop: "12px" }}>
                             <span>⏱ {fmtDur(meta.answerDurationSeconds)}</span>
                             <span>🗣 {meta.fillerWordCount} filler{meta.fillerWordCount !== 1 ? "s" : ""}</span>
                             <span>Ideal: {meta.idealDurationRange}</span>
+                            {meta.cameraViolationType && meta.cameraViolationType !== "none" && (
+                              <span style={{ color: "#ef4444" }}>📷 {meta.cameraViolationNote || meta.cameraViolationType}</span>
+                            )}
                           </div>
                         )}
                         {meta?.transcript && meta.transcript !== "[SKIPPED]" && (
@@ -243,7 +304,14 @@ export default function Report() {
         {/* Actions */}
         <div style={{ display: "flex", gap: "12px" }}>
           <button
-            onClick={() => { sessionStorage.removeItem("interviewReport"); sessionStorage.removeItem("interviewMetadata"); sessionStorage.removeItem("integrityFlags"); router.push("/settings?mode=interview"); }}
+            onClick={() => {
+              sessionStorage.removeItem("interviewReport");
+              sessionStorage.removeItem("interviewMetadata");
+              sessionStorage.removeItem("integrityFlags");
+              sessionStorage.removeItem("cameraViolations");
+              sessionStorage.removeItem("terminationReason");
+              router.push("/settings?mode=interview");
+            }}
             style={{ flex: 1, background: "#1d4ed8", color: "#fff", border: "none", padding: "14px", borderRadius: "12px", fontSize: "15px", fontWeight: 700, cursor: "pointer" }}
           >
             Try Again →

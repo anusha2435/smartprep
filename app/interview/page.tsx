@@ -30,6 +30,9 @@ type AnswerMetadata = {
   longestPauseSeconds: number;
   skipped?: boolean;
   cameraSnapshot?: string;
+  // NEW: camera proctoring
+  cameraViolationType?: "absent" | "multiple_faces" | "looking_away" | "none";
+  cameraViolationNote?: string;
 };
 
 type InterviewMessage = {
@@ -45,6 +48,9 @@ type InterviewMessage = {
 const FILLER_WORDS = ["um", "uh", "like", "you know", "basically", "literally", "actually", "so", "right", "okay"];
 const IDEAL_DURATION: Record<string, string> = { Screening: "60-90s", Technical: "120-180s", Behavioral: "90-120s", Final: "90-150s" };
 const CANDIDATE_QS: Record<string, number> = { Screening: 1, Technical: 1, Behavioral: 1, Final: 2 };
+
+// NEW: Max camera violations before termination
+const MAX_CAMERA_VIOLATIONS = 3;
 
 /* ============================================================
    HELPERS
@@ -92,8 +98,15 @@ export default function Interview() {
   const [candidateInput, setCandidateInput] = useState("");
   const [candidateAnswers, setCandidateAnswers] = useState<InterviewMessage[]>([]);
 
+  // Tab-switch integrity
   const [integrityFlags, setIntegrityFlags] = useState(0);
   const [showTabWarning, setShowTabWarning] = useState(false);
+
+  // NEW: Camera violation tracking (separate from tab switches)
+  const [cameraViolations, setCameraViolations] = useState(0);
+  const [showCameraWarning, setShowCameraWarning] = useState(false);
+  const [cameraWarningMsg, setCameraWarningMsg] = useState("");
+
   const [sessionEnded, setSessionEnded] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
   const [isListening, setIsListening] = useState(false);
@@ -107,6 +120,7 @@ export default function Interview() {
   const ttsEnabledRef = useRef(false);
   const phaseRef = useRef<InterviewPhase>("requesting-permissions");
   const integrityRef = useRef(0);
+  const cameraViolationsRef = useRef(0); // NEW
   const graceRef = useRef(true);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
@@ -161,7 +175,7 @@ export default function Interview() {
         integrityRef.current += 1;
         setIntegrityFlags(integrityRef.current);
         setShowTabWarning(true);
-        if (integrityRef.current >= 3) handleAutoEnd("integrity");
+        if (integrityRef.current >= 3) handleAutoEnd("tab-switch");
       }
     }
     document.addEventListener("visibilitychange", onVisibility);
@@ -178,6 +192,7 @@ export default function Interview() {
 
   /* ============================================================
      REQUEST PERMISSIONS
+     FIX: video: true instead of facingMode:"user" so PC camera works
      ============================================================ */
   async function requestPermissions() {
     try {
@@ -221,7 +236,7 @@ export default function Interview() {
   }
 
   /* ============================================================
-     SNAPSHOT
+     SNAPSHOT — takes frame and sends to AI for analysis
      ============================================================ */
   function scheduleSnapshot(durationHint = 30) {
     snapshotTakenRef.current = false;
@@ -236,8 +251,57 @@ export default function Interview() {
         canvas.getContext("2d")?.drawImage(videoRef.current, 0, 0);
         snapshotRef.current = canvas.toDataURL("image/jpeg", 0.6);
         snapshotTakenRef.current = true;
+
+        // NEW: analyze snapshot immediately for proctoring
+        analyzeSnapshot(snapshotRef.current);
       } catch { }
     }, delay);
+  }
+
+  /* ============================================================
+     NEW: ANALYZE SNAPSHOT via API for proctoring
+     Sends snapshot to a lightweight endpoint that checks:
+     - Is a face present?
+     - Is person looking away?
+     - Multiple people?
+     Returns a violation type or "none"
+     ============================================================ */
+  async function analyzeSnapshot(snapshotBase64: string) {
+    try {
+      const res = await fetch("/api/proctor", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ snapshot: snapshotBase64 }),
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+
+      // data.violation = "none" | "absent" | "looking_away" | "multiple_faces"
+      if (data.violation && data.violation !== "none") {
+        cameraViolationsRef.current += 1;
+        setCameraViolations(cameraViolationsRef.current);
+        setCameraWarningMsg(violationMessage(data.violation));
+        setShowCameraWarning(true);
+
+        // Auto-hide warning after 5s (unless terminated)
+        setTimeout(() => setShowCameraWarning(false), 5000);
+
+        if (cameraViolationsRef.current >= MAX_CAMERA_VIOLATIONS) {
+          handleAutoEnd("camera-proctoring");
+        }
+      }
+    } catch {
+      // Proctor API failed silently — don't break the interview
+    }
+  }
+
+  function violationMessage(type: string): string {
+    switch (type) {
+      case "absent": return "No face detected. Please stay in frame.";
+      case "looking_away": return "Please maintain eye contact with the camera.";
+      case "multiple_faces": return "Multiple people detected. This must be a solo interview.";
+      default: return "Camera check failed.";
+    }
   }
 
   /* ============================================================
@@ -307,6 +371,7 @@ export default function Interview() {
         conversationHistory: history,
         answerMetadata: metadata || [],
         integrityFlags: integrityRef.current,
+        cameraViolations: cameraViolationsRef.current, // NEW: pass camera violations
       }),
     });
     return res.json();
@@ -314,21 +379,32 @@ export default function Interview() {
 
   /* ============================================================
      SAVE TO LOCALSTORAGE
+     FIX: deduplicate by sessionId so the same session is never
+     saved twice — only the latest version overwrites itself.
      ============================================================ */
+  const sessionIdRef = useRef<string>(
+    `session_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+  );
+
   function saveLS(history: ConversationTurn[], metadata: AnswerMetadata[], report?: any) {
     try {
       const d = {
-        timestamp: Date.now(), settings,
+        sessionId: sessionIdRef.current,  // stable across saves for this session
+        timestamp: Date.now(),
+        settings,
         conversationHistory: history,
         allMetadata: metadata,
         integrityFlags: integrityRef.current,
+        cameraViolations: cameraViolationsRef.current,
         report: report || null,
       };
       localStorage.setItem("lastInterviewSession", JSON.stringify(d));
-      const existing = JSON.parse(localStorage.getItem("interviewSessions") || "[]");
-      const filtered = existing.filter((s: any) => Math.abs(s.timestamp - d.timestamp) > 10000);
-      filtered.unshift(d);
-      localStorage.setItem("interviewSessions", JSON.stringify(filtered.slice(0, 20)));
+
+      // FIX: load existing, remove this session's id, re-insert updated version
+      const existing: any[] = JSON.parse(localStorage.getItem("interviewSessions") || "[]");
+      const deduped = existing.filter((s: any) => s.sessionId !== sessionIdRef.current);
+      deduped.unshift(d);
+      localStorage.setItem("interviewSessions", JSON.stringify(deduped.slice(0, 20)));
     } catch { }
   }
 
@@ -408,7 +484,11 @@ export default function Interview() {
 
       if (data.done === true || isLast) {
         if (data.report) {
-          sessionStorage.setItem("interviewReport", JSON.stringify({ ...data.report, integrityFlags: integrityRef.current }));
+          sessionStorage.setItem("interviewReport", JSON.stringify({
+            ...data.report,
+            integrityFlags: integrityRef.current,
+            cameraViolations: cameraViolationsRef.current,
+          }));
           sessionStorage.setItem("interviewMetadata", JSON.stringify(newAllMeta));
         }
         saveLS(updatedHistory, newAllMeta, data.report);
@@ -460,7 +540,11 @@ export default function Interview() {
 
       if (data.done === true || isLast) {
         if (data.report) {
-          sessionStorage.setItem("interviewReport", JSON.stringify({ ...data.report, integrityFlags: integrityRef.current }));
+          sessionStorage.setItem("interviewReport", JSON.stringify({
+            ...data.report,
+            integrityFlags: integrityRef.current,
+            cameraViolations: cameraViolationsRef.current,
+          }));
           sessionStorage.setItem("interviewMetadata", JSON.stringify(newAllMeta));
         }
         setMessages([...updatedMsgs, { role: "interviewer", text: "That concludes my questions. Do you have any questions for me?" }]);
@@ -509,22 +593,36 @@ export default function Interview() {
   }
 
   /* ============================================================
-     AUTO-END
+     AUTO-END — handles both tab-switch and camera violations
      ============================================================ */
   async function handleAutoEnd(reason: string) {
     setSessionEnded(true);
     setShowTabWarning(false);
+    setShowCameraWarning(false);
     stopListening();
     stopTimer();
     setPhase("done");
     sessionStorage.setItem("interviewMetadata", JSON.stringify(allMetadata));
     sessionStorage.setItem("integrityFlags", String(integrityRef.current));
-    const hard = setTimeout(() => { streamRef.current?.getTracks().forEach(t => t.stop()); router.push("/report"); }, 5000);
+    sessionStorage.setItem("cameraViolations", String(cameraViolationsRef.current));
+    sessionStorage.setItem("terminationReason", reason); // NEW
+
+    const hard = setTimeout(() => {
+      streamRef.current?.getTracks().forEach(t => t.stop());
+      router.push("/report");
+    }, 5000);
+
     try {
       if (allMetadata.length > 0) {
         const data = await callAI("SESSION ENDED EARLY. Generate partial report.", conversationHistory, allMetadata);
         if (data.report) {
-          sessionStorage.setItem("interviewReport", JSON.stringify({ ...data.report, integrityFlags: integrityRef.current, sessionEndedEarly: true }));
+          sessionStorage.setItem("interviewReport", JSON.stringify({
+            ...data.report,
+            integrityFlags: integrityRef.current,
+            cameraViolations: cameraViolationsRef.current,
+            sessionEndedEarly: true,
+            terminationReason: reason,
+          }));
         }
       }
     } catch { }
@@ -548,6 +646,7 @@ export default function Interview() {
      ============================================================ */
   const isProcessing = phase === "processing";
   const idealDuration = IDEAL_DURATION[settings.round] || "90-120s";
+  const totalViolations = integrityFlags + cameraViolations;
 
   const S = {
     page: { display: "flex", height: "100vh", background: "#0a0a0a", color: "#f0f0f0", fontFamily: "'DM Sans','Inter',sans-serif", overflow: "hidden" } as React.CSSProperties,
@@ -606,12 +705,12 @@ export default function Interview() {
             <h2 style={{ fontSize: "18px", fontWeight: 700, color: "#ef4444", marginBottom: "10px" }}>Tab Switch Detected</h2>
             <p style={{ color: "#888", fontSize: "13px", marginBottom: "6px" }}>Switching tabs during an interview is not permitted.</p>
             <p style={{ color: "#666", fontSize: "12px", marginBottom: "20px" }}>
-              Violation {integrityFlags} of 3. At 3 violations your session ends and is marked as unethical conduct.
+              Violation {integrityFlags} of 3. At 3 violations your session ends.
             </p>
             {integrityFlags >= 3 ? (
               <div>
-                <p style={{ color: "#ef4444", fontWeight: 700, marginBottom: "8px" }}>❌ Unethical Conduct Detected</p>
-                <p style={{ color: "#666", fontSize: "12px" }}>Session is ending...</p>
+                <p style={{ color: "#ef4444", fontWeight: 700, marginBottom: "8px" }}>❌ Session Terminated</p>
+                <p style={{ color: "#666", fontSize: "12px" }}>Generating your report...</p>
               </div>
             ) : (
               <button onClick={() => setShowTabWarning(false)} style={{ background: "#7f1d1d", color: "#fff", border: "none", padding: "10px 24px", borderRadius: "8px", fontSize: "14px", cursor: "pointer" }}>
@@ -619,6 +718,30 @@ export default function Interview() {
               </button>
             )}
           </div>
+        </div>
+      )}
+
+      {/* NEW: CAMERA VIOLATION OVERLAY (non-blocking — banner style) */}
+      {showCameraWarning && (
+        <div style={{
+          position: "fixed", top: "16px", left: "50%", transform: "translateX(-50%)",
+          zIndex: 40, background: "#1a0000", border: "1px solid #7f1d1d",
+          borderRadius: "12px", padding: "14px 20px", maxWidth: "420px", width: "90%",
+          display: "flex", alignItems: "center", gap: "12px",
+        }}>
+          <span style={{ fontSize: "20px" }}>📷</span>
+          <div style={{ flex: 1 }}>
+            <p style={{ fontSize: "13px", color: "#f87171", fontWeight: 600, marginBottom: "2px" }}>
+              Camera Warning {cameraViolations}/{MAX_CAMERA_VIOLATIONS}
+            </p>
+            <p style={{ fontSize: "12px", color: "#ef4444" }}>{cameraWarningMsg}</p>
+            {cameraViolations >= MAX_CAMERA_VIOLATIONS && (
+              <p style={{ fontSize: "12px", color: "#ef4444", fontWeight: 700, marginTop: "4px" }}>
+                Session terminating...
+              </p>
+            )}
+          </div>
+          <button onClick={() => setShowCameraWarning(false)} style={{ background: "transparent", border: "none", color: "#555", cursor: "pointer", fontSize: "16px" }}>✕</button>
         </div>
       )}
 
@@ -643,9 +766,22 @@ export default function Interview() {
               <span style={{ fontSize: "11px", color: "#ef4444" }}>Recording</span>
             </div>
           )}
-          {integrityFlags > 0 && (
+
+          {/* Unified violation counter — shows tab + camera combined */}
+          {totalViolations > 0 && (
             <div style={{ position: "absolute", top: "12px", right: "12px", background: "rgba(127,29,29,0.85)", padding: "4px 10px", borderRadius: "20px" }}>
-              <span style={{ fontSize: "11px", color: "#fca5a5" }}>⚠️ {integrityFlags}/3</span>
+              <span style={{ fontSize: "11px", color: "#fca5a5" }}>
+                ⚠️ {totalViolations} flag{totalViolations > 1 ? "s" : ""}
+              </span>
+            </div>
+          )}
+
+          {/* Camera violation specific badge */}
+          {cameraViolations > 0 && (
+            <div style={{ position: "absolute", bottom: "12px", left: "12px", background: "rgba(127,29,29,0.85)", padding: "4px 10px", borderRadius: "20px" }}>
+              <span style={{ fontSize: "11px", color: "#fca5a5" }}>
+                📷 {cameraViolations}/{MAX_CAMERA_VIOLATIONS}
+              </span>
             </div>
           )}
         </div>
@@ -695,7 +831,13 @@ export default function Interview() {
                 The AI interviewer will ask you <strong style={{ color: "#fff" }}>6 questions</strong>. No feedback during the session — exactly like a real interview.
               </p>
               <div style={{ background: "#111", border: "1px solid #1e1e1e", borderRadius: "14px", padding: "18px", textAlign: "left", marginBottom: "28px" }}>
-                {[["📋 Round", settings.round], ["⏱ Ideal answer", idealDuration], ["🚫 Feedback", "only after all 6 questions"], ["📷 Camera", "active — maintain eye contact"], ["⚠️ Tab switching", "is monitored"]].map(([k, v]) => (
+                {[
+                  ["📋 Round", settings.round],
+                  ["⏱ Ideal answer", idealDuration],
+                  ["🚫 Feedback", "only after all 6 questions"],
+                  ["📷 Camera", "active — proctored (3 violations = terminated)"],
+                  ["⚠️ Tab switching", "monitored (3 switches = terminated)"],
+                ].map(([k, v]) => (
                   <p key={k} style={{ fontSize: "13px", color: "#888", marginBottom: "8px" }}>{k}: <span style={{ color: "#e5e7eb" }}>{v}</span></p>
                 ))}
               </div>
@@ -727,7 +869,6 @@ export default function Interview() {
                 </div>
               ))}
 
-              {/* Candidate questions */}
               {phase === "candidate-questions" && candidateAnswers.map((msg, i) => (
                 <div key={`cq-${i}`} style={{ display: "flex", justifyContent: msg.role === "candidate" ? "flex-end" : "flex-start" }}>
                   <div style={msg.role === "candidate" ? S.candidateBubble : S.interviewerBubble}>{msg.text}</div>
@@ -750,7 +891,6 @@ export default function Interview() {
             {/* CONTROLS */}
             <div style={{ padding: "16px 24px", borderTop: "1px solid #1e1e1e", flexShrink: 0 }}>
 
-              {/* PREPARE */}
               {phase === "prepare" && (
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px" }}>
                   <div>
@@ -768,7 +908,6 @@ export default function Interview() {
                 </div>
               )}
 
-              {/* ANSWERING */}
               {phase === "answering" && (
                 <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
                   <div style={{ background: "#111", border: "1px solid #2a2a2a", borderRadius: "12px", padding: "12px 16px", minHeight: "60px", maxHeight: "120px", overflowY: "auto" }}>
@@ -790,7 +929,6 @@ export default function Interview() {
                 </div>
               )}
 
-              {/* CANDIDATE QUESTIONS */}
               {phase === "candidate-questions" && candidateQsLeft > 0 && (
                 <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
                   <p style={{ fontSize: "12px", color: "#666" }}>
